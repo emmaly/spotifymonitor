@@ -22,6 +22,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
+	"github.com/lucasb-eyer/go-colorful"
 	color_extractor "github.com/marekm4/color-extractor"
 	"github.com/zmb3/spotify/v2"
 	spotifyauth "github.com/zmb3/spotify/v2/auth"
@@ -225,6 +226,30 @@ func getCurrentStatus(state *spotify.CurrentlyPlaying) map[string]interface{} {
 	textColorStr := strings.Join(textColorStrs, ",")
 	fmt.Println("Text color:", textColorStr)
 
+	// Progress color based on album art color
+	progressColorRGBA_Triadic1, progressColorRGBA_Triadic2 := provideTriadicColors(color.RGBA{uint8(albumArtColor[0]), uint8(albumArtColor[1]), uint8(albumArtColor[2]), 255})
+	progressColorRGBA_Analogous1, progressColorRGBA_Analogous2 := provideAnalogousColors(color.RGBA{uint8(albumArtColor[0]), uint8(albumArtColor[1]), uint8(albumArtColor[2]), 255})
+	progressColorRGBA_Complementary := provideComplementaryColor(color.RGBA{uint8(albumArtColor[0]), uint8(albumArtColor[1]), uint8(albumArtColor[2]), 255})
+	progressColorRGBA := chooseBestContrastingColor(
+		color.RGBA{uint8(albumArtColor[0]), uint8(albumArtColor[1]), uint8(albumArtColor[2]), 255},
+		[]color.RGBA{
+			progressColorRGBA_Triadic1,
+			progressColorRGBA_Triadic2,
+			progressColorRGBA_Analogous1,
+			progressColorRGBA_Analogous2,
+			progressColorRGBA_Complementary,
+		})
+	fmt.Println("Progress color RGBA:", progressColorRGBA)
+	progressColor := []uint32{uint32(progressColorRGBA.R), uint32(progressColorRGBA.G), uint32(progressColorRGBA.B)}
+	// Convert each uint32 to string
+	progressColorStrs := make([]string, len(progressColor))
+	for i, num := range progressColor {
+		progressColorStrs[i] = strconv.Itoa(int(num))
+	}
+	// Join the string slice with commas
+	progressColorStr := strings.Join(progressColorStrs, ",")
+	fmt.Println("Progress color:", progressColorStr)
+
 	// Create a report object with adjusted progress
 	report := map[string]interface{}{
 		"timestamp":           time.Now().Unix(),
@@ -246,6 +271,8 @@ func getCurrentStatus(state *spotify.CurrentlyPlaying) map[string]interface{} {
 		"album_art_colors":    albumArtColors,
 		"text_color_rgb":      textColorStr,
 		"text_color":          textColor,
+		"progress_color_rgb":  progressColorStr,
+		"progress_color":      progressColor,
 	}
 
 	return report
@@ -374,130 +401,201 @@ func extractColors(imagePath string) []color.Color {
 	return colors
 }
 
-func relativeLuminance(c color.RGBA) float64 {
-	// Convert RGB values to sRGB
-	r := sRGBToLinear(float64(c.R) / 255.0)
-	g := sRGBToLinear(float64(c.G) / 255.0)
-	b := sRGBToLinear(float64(c.B) / 255.0)
+func convertToXYZ(c color.Color) (x, y, z float64) {
+	// First convert c to colorful.Color
+	cfColor, ok := colorful.MakeColor(c)
+	if !ok {
+		// Handle error case where conversion failed
+		return
+	}
+
+	// Then use cfColor.Xyz() to get XYZ values
+	x, y, z = cfColor.Xyz()
+	return
+}
+
+func calculateContrastRatio(c1, c2 color.Color) float64 {
+	// Convert colors to XYZ color space
+	x1, y1, z1 := convertToXYZ(c1)
+	x2, y2, z2 := convertToXYZ(c2)
 
 	// Calculate relative luminance
-	return 0.2126*r + 0.7152*g + 0.0722*b
-}
-
-func sRGBToLinear(c float64) float64 {
-	if c <= 0.03928 {
-		return c / 12.92
-	}
-	return math.Pow((c+0.055)/1.055, 2.4)
-}
-
-func calculateContrastRatio(l1, l2 float64) float64 {
-	// Ensure l1 is the lighter color
-	if l1 < l2 {
-		l1, l2 = l2, l1
-	}
+	lum1 := 0.2126*x1 + 0.7152*y1 + 0.0722*z1
+	lum2 := 0.2126*x2 + 0.7152*y2 + 0.0722*z2
 
 	// Calculate contrast ratio
-	return (l1 + 0.05) / (l2 + 0.05)
-}
-
-func calculateColorContrast(c1, c2 color.RGBA) float64 {
-	// Calculate relative luminance for each color
-	l1 := relativeLuminance(c1)
-	l2 := relativeLuminance(c2)
-
-	// Calculate contrast ratio
-	return calculateContrastRatio(l1, l2)
+	if lum1 > lum2 {
+		return (lum1 + 0.05) / (lum2 + 0.05)
+	}
+	return (lum2 + 0.05) / (lum1 + 0.05)
 }
 
 func provideTextColor(bgColor color.RGBA) color.RGBA {
-	// Calculate the contrast ratio with black and white
-	blackContrast := calculateColorContrast(bgColor, color.RGBA{0, 0, 0, 255})
-	whiteContrast := calculateColorContrast(bgColor, color.RGBA{255, 255, 255, 255})
+	return chooseBestContrastingColor(bgColor, []color.RGBA{{0, 0, 0, 255}, {255, 255, 255, 255}})
+}
 
-	// Return black or white based on the higher contrast ratio
-	if blackContrast > whiteContrast {
-		return color.RGBA{0, 0, 0, 255}
+func chooseBestContrastingColor(c color.RGBA, colors []color.RGBA) color.RGBA {
+	var bestColor color.RGBA
+	var bestContrast float64
+
+	// Convert base color to colorful.Color
+	baseColor := colorful.Color{R: float64(c.R) / 255, G: float64(c.G) / 255, B: float64(c.B) / 255}
+
+	for _, col := range colors {
+		// Convert color to colorful.Color
+		contrastColor := colorful.Color{R: float64(col.R) / 255, G: float64(col.G) / 255, B: float64(col.B) / 255}
+
+		// Calculate contrast ratio
+		contrast := calculateContrastRatio(baseColor, contrastColor)
+
+		// Update best color if contrast is higher
+		if contrast > bestContrast {
+			bestContrast = contrast
+			bestColor = col
+		}
 	}
-	return color.RGBA{255, 255, 255, 255}
+
+	return bestColor
+}
+
+func rgbToHSL(r, g, b uint8) (h, s, l float64) {
+	c := colorful.Color{R: float64(r) / 255, G: float64(g) / 255, B: float64(b) / 255}
+	h, s, l = c.Hsl()
+	return
+}
+
+func hslToRGB(h, s, l float64) (r, g, b uint8) {
+	c := colorful.Hsl(h, s, l)
+	r, g, b = uint8(c.R*255), uint8(c.G*255), uint8(c.B*255)
+	return
+}
+
+func provideAnalogousColors(c color.RGBA) (color.RGBA, color.RGBA) {
+	// Convert RGBA to HSL
+	h, s, l := rgbToHSL(c.R, c.G, c.B)
+
+	// Calculate analogous hues by adding/subtracting 30 degrees
+	h1 := math.Mod(h+30, 360)
+	h2 := math.Mod(h-30, 360)
+
+	// Convert HSL back to RGBA
+	r1, g1, b1 := hslToRGB(h1, s, l)
+	r2, g2, b2 := hslToRGB(h2, s, l)
+
+	return color.RGBA{R: r1, G: g1, B: b1, A: c.A},
+		color.RGBA{R: r2, G: g2, B: b2, A: c.A}
+}
+
+func provideTriadicColors(c color.RGBA) (color.RGBA, color.RGBA) {
+	// Convert RGBA to HSL
+	h, s, l := rgbToHSL(c.R, c.G, c.B)
+
+	// Calculate triadic hues by adding/subtracting 120 degrees
+	h1 := math.Mod(h+120, 360)
+	h2 := math.Mod(h+240, 360)
+
+	// Convert HSL back to RGBA
+	r1, g1, b1 := hslToRGB(h1, s, l)
+	r2, g2, b2 := hslToRGB(h2, s, l)
+
+	return color.RGBA{R: r1, G: g1, B: b1, A: c.A},
+		color.RGBA{R: r2, G: g2, B: b2, A: c.A}
+}
+
+func provideComplementaryColor(c color.RGBA) color.RGBA {
+	// Convert RGBA to HSL
+	h, s, l := rgbToHSL(c.R, c.G, c.B)
+
+	// Calculate complementary hue by adding 180 degrees
+	h = math.Mod(h+180, 360)
+
+	// Convert HSL back to RGBA
+	r, g, b := hslToRGB(h, s, l)
+
+	return color.RGBA{R: r, G: g, B: b, A: c.A}
 }
 
 const playerTemplate string = `
 <!DOCTYPE html>
 <html>
 	<head>
+		<link rel="preconnect" href="https://fonts.googleapis.com">
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+		<link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,100..900;1,100..900&display=swap" rel="stylesheet">
 		<style>
-		body {
-			background-color: transparent;
-		}
+			body {
+				background-color: transparent;
+				font-family: "Montserrat", sans-serif;
+				font-optical-sizing: auto;
+				font-weight: 400;
+				font-style: normal;
+			}
 
-		.player {
-			display: flex;
-			min-width: 500px;
-			max-width: 500px;
-			align-items: center;
-			padding: 20px;
-			background-color: rgba({{.AlbumArtColorRGB}}, 0.6);
-			border-radius: 8px;
-			box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-		}
+			.player {
+				display: flex;
+				min-width: 500px;
+				max-width: 500px;
+				align-items: center;
+				padding: 20px;
+				background-color: rgba({{.AlbumArtColorRGB}}, 0.6);
+				border-radius: 8px;
+				box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+			}
 
-		.album-art {
-			width: 100px;
-			height: 100px;
-			margin-right: 20px;
-			flex-shrink: 0;
-		}
+			.album-art {
+				width: 100px;
+				height: 100px;
+				margin-right: 20px;
+				flex-shrink: 0;
+			}
 
-		.album-art img {
-			width: 100%;
-			height: 100%;
-			object-fit: cover;
-			border-radius: 4px;
-		}
+			.album-art img {
+				width: 100%;
+				height: 100%;
+				object-fit: cover;
+				border-radius: 4px;
+			}
 
-		.track-info {
-			flex: 1;
-			min-width: 0;
-			overflow: hidden;
-		}
+			.track-info {
+				flex: 1;
+				min-width: 0;
+				overflow: hidden;
+			}
 
-		.track-title {
-			font-size: 22px;
-			font-weight: x-bold;
-			margin: 0;
-			color: rgba({{.TextColorRGB}}, 1.0);
-			overflow: hidden;
-			white-space: nowrap;
-		}
+			.track-title {
+				font-weight: 600;
+				font-size: 22px;
+				margin: 0;
+				color: rgba({{.TextColorRGB}}, 1.0);
+				overflow: hidden;
+				white-space: nowrap;
+			}
 
-		.artist {
-			font-size: 16px;
-			font-weight: bold;
-			color: rgba({{.TextColorRGB}}, 1.0);
-			margin: 5px 0;
-		}
+			.artist {
+				font-size: 16px;
+				color: rgba({{.TextColorRGB}}, 1.0);
+				margin: 5px 0;
+			}
 
-		.progress-bar {
-			height: 6px;
-			background-color: #eee;
-			border-radius: 3px;
-			margin: 10px 0;
-		}
+			.progress-bar {
+				height: 6px;
+				background-color: rgba(200, 200, 200, 0.25);
+				border-radius: 3px;
+				margin: 10px 0;
+			}
 
-		.progress {
-			height: 100%;
-			background-color: #1db954;
-			border-radius: 3px;
-		}
+			.progress {
+				height: 100%;
+				background-color: rgba({{.ProgressColorRGB}}, 0.8);
+				border-radius: 3px;
+			}
 
-		.duration {
-			display: flex;
-			justify-content: space-between;
-			font-size: 14px;
-			font-weight: bold;
-			color: rgba({{.TextColorRGB}}, 1.0);
-		}
+			.duration {
+				font-size: 14px;
+				display: flex;
+				justify-content: space-between;
+				color: rgba({{.TextColorRGB}}, 1.0);
+			}
 		</style>
 	</head>
 	<body>
@@ -540,6 +638,7 @@ const playerTemplate string = `
 					document.querySelector(".track-title").style.color = "rgba(" + data.text_color_rgb + ", 1.0)";
 					document.querySelector(".artist").style.color = "rgba(" + data.text_color_rgb + ", 1.0)";
 					document.querySelector(".duration").style.color = "rgba(" + data.text_color_rgb + ", 1.0)";
+					document.querySelector(".progress").style.backgroundColor = "rgba(" + data.progress_color_rgb + ", 1.0)";
 				};
 
 				socket.onclose = function (event) {
