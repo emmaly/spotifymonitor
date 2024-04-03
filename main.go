@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"image"
 	"image/color"
 	_ "image/jpeg"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	color_extractor "github.com/marekm4/color-extractor"
 	"github.com/zmb3/spotify/v2"
@@ -31,11 +33,17 @@ var (
 	stateMutex    sync.Mutex
 	imageCacheDir string
 	reportURL     string
+	upgrader      = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+	wsClients = make(map[*websocket.Conn]bool)
 )
 
 func main() {
 	godotenv.Load(".env")
 	httpPort := os.Getenv("HTTP_PORT")
+	wsURL := os.Getenv("WS_URL")
 	imageCacheDir = os.Getenv("IMAGE_CACHE_DIR")
 	if imageCacheDir == "" {
 		imageCacheDir = "image_cache"
@@ -57,7 +65,7 @@ func main() {
 
 	// Set up a web server to handle the OAuth callback
 	ch := make(chan *oauth2.Token)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	tokenReceiverHandler := func(w http.ResponseWriter, r *http.Request) {
 		logger.Println("Received request:", r.URL.String())
 
 		token, err := auth.Token(r.Context(), "state", r)
@@ -72,18 +80,33 @@ func main() {
 		}
 
 		// Print the token details
-		// logger.Printf("Access token: %s\n", token.AccessToken)
-		// logger.Printf("Refresh token: %s\n", token.RefreshToken)
 		logger.Printf("Token type: %s\n", token.TokenType)
 		logger.Printf("Expires in: %d seconds\n", token.Expiry.Unix()-time.Now().Unix())
 
 		// Display a success message
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, "Success! You can now close this window.")
+		fmt.Fprintf(w, "Success! You can now close this window. <a href='./'>./</a>")
 
 		// Send the token through a channel
 		ch <- token
+	}
+	http.HandleFunc("/callback", tokenReceiverHandler)
+	http.HandleFunc("/_spotifymonitor/callback", tokenReceiverHandler)
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		state := getCurrentStatus(currentState)
+		state["httpPort"] = httpPort
+		state["wsURL"] = wsURL
+		tmpl := template.Must(template.New("").Parse(playerTemplate))
+		err := tmpl.Execute(w, state)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 	})
+
+	http.HandleFunc("/ws", handleWebSocket)
+	http.HandleFunc("/_spotifymonitor/ws", handleWebSocket)
+
 	go http.ListenAndServe(":"+httpPort, nil)
 
 	// Wait for the user to authorize the application and get the token
@@ -124,9 +147,29 @@ func main() {
 	}
 }
 
-func sendCurrentStatus(state *spotify.CurrentlyPlaying) {
-	if state == nil {
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println(err)
 		return
+	}
+	defer conn.Close()
+
+	wsClients[conn] = true
+
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			log.Println(err)
+			delete(wsClients, conn)
+			break
+		}
+	}
+}
+
+func getCurrentStatus(state *spotify.CurrentlyPlaying) map[string]interface{} {
+	if state == nil {
+		return nil
 	}
 
 	// Calculate the elapsed time since the last update
@@ -205,6 +248,17 @@ func sendCurrentStatus(state *spotify.CurrentlyPlaying) {
 		"text_color":          textColor,
 	}
 
+	return report
+}
+
+func sendCurrentStatus(state *spotify.CurrentlyPlaying) {
+	if state == nil {
+		return
+	}
+
+	// Get the status details
+	report := getCurrentStatus(state)
+
 	// Convert the report to JSON
 	jsonData, err := json.Marshal(report)
 	if err != nil {
@@ -213,12 +267,26 @@ func sendCurrentStatus(state *spotify.CurrentlyPlaying) {
 	}
 
 	// Send the report via POST request
-	resp, err := http.Post(reportURL, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		fmt.Println("Error sending POST request:", err)
-	} else {
-		resp.Body.Close()
-		fmt.Println("Current status reported")
+	if reportURL != "" {
+		resp, err := http.Post(reportURL, "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			fmt.Println("Error sending POST request:", err)
+		} else {
+			resp.Body.Close()
+			fmt.Println("Current status reported")
+		}
+	}
+
+	// Send the report to WebSocket clients
+	if len(wsClients) != 0 {
+		for client := range wsClients {
+			err := client.WriteMessage(websocket.TextMessage, jsonData)
+			if err != nil {
+				log.Println("Error sending message to WebSocket client:", err)
+				client.Close()
+				delete(wsClients, client)
+			}
+		}
 	}
 }
 
@@ -353,3 +421,139 @@ func provideTextColor(bgColor color.RGBA) color.RGBA {
 	}
 	return color.RGBA{255, 255, 255, 255}
 }
+
+const playerTemplate string = `
+<!DOCTYPE html>
+<html>
+	<head>
+		<style>
+		body {
+			background-color: transparent;
+		}
+
+		.player {
+			display: flex;
+			min-width: 500px;
+			max-width: 500px;
+			align-items: center;
+			padding: 20px;
+			background-color: rgba({{.AlbumArtColorRGB}}, 0.6);
+			border-radius: 8px;
+			box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+		}
+
+		.album-art {
+			width: 100px;
+			height: 100px;
+			margin-right: 20px;
+			flex-shrink: 0;
+		}
+
+		.album-art img {
+			width: 100%;
+			height: 100%;
+			object-fit: cover;
+			border-radius: 4px;
+		}
+
+		.track-info {
+			flex: 1;
+			min-width: 0;
+			overflow: hidden;
+		}
+
+		.track-title {
+			font-size: 22px;
+			font-weight: x-bold;
+			margin: 0;
+			color: rgba({{.TextColorRGB}}, 1.0);
+			overflow: hidden;
+			white-space: nowrap;
+		}
+
+		.artist {
+			font-size: 16px;
+			font-weight: bold;
+			color: rgba({{.TextColorRGB}}, 1.0);
+			margin: 5px 0;
+		}
+
+		.progress-bar {
+			height: 6px;
+			background-color: #eee;
+			border-radius: 3px;
+			margin: 10px 0;
+		}
+
+		.progress {
+			height: 100%;
+			background-color: #1db954;
+			border-radius: 3px;
+		}
+
+		.duration {
+			display: flex;
+			justify-content: space-between;
+			font-size: 14px;
+			font-weight: bold;
+			color: rgba({{.TextColorRGB}}, 1.0);
+		}
+		</style>
+	</head>
+	<body>
+		<div class="player">
+			<div class="album-art">
+				<img src="{{.AlbumArtURL}}" alt="Album Art">
+			</div>
+			<div class="track-info">
+				<h2 class="track-title">{{.Track}}</h2>
+				<p class="artist">{{.Artist}}</p>
+				<div class="progress-bar">
+					<div class="progress" style="width: {{.ProgressPct}}%"></div>
+				</div>
+				<div class="duration">
+					<span class="current-time">{{.ProgressStr}}</span>
+					<span class="total-time">{{.DurationStr}}</span>
+				</div>
+			</div>
+		</div>
+		<script>
+			var socket;
+			var reconnectInterval = 5000; // Reconnect interval in milliseconds
+
+			function connect() {
+				socket = new WebSocket("{{.wsURL}}");
+
+				socket.onopen = function (event) {
+					console.log("WebSocket connected");
+				};
+
+				socket.onmessage = function (event) {
+					var data = JSON.parse(event.data);
+					document.querySelector(".album-art img").src = data.album_art_url;
+					document.querySelector(".track-title").textContent = data.track;
+					document.querySelector(".artist").textContent = data.artist;
+					document.querySelector(".progress").style.width = data.progress_pct_str;
+					document.querySelector(".current-time").textContent = data.progress_str;
+					document.querySelector(".total-time").textContent = data.duration_str;
+					document.querySelector(".player").style.backgroundColor = "rgba(" + data.album_art_color_rgb + ", 0.6)";
+					document.querySelector(".track-title").style.color = "rgba(" + data.text_color_rgb + ", 1.0)";
+					document.querySelector(".artist").style.color = "rgba(" + data.text_color_rgb + ", 1.0)";
+					document.querySelector(".duration").style.color = "rgba(" + data.text_color_rgb + ", 1.0)";
+				};
+
+				socket.onclose = function (event) {
+					console.log("WebSocket disconnected. Reconnecting in " + reconnectInterval + "ms...");
+					setTimeout(connect, reconnectInterval);
+				};
+
+				socket.onerror = function (error) {
+					console.error("WebSocket error: ", error);
+				};
+			}
+
+			connect();
+		</script>
+	</body>
+</html>
+`
