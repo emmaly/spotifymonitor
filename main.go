@@ -538,6 +538,12 @@ const playerTemplate string = `
 				align-items: center;
 				padding: 20px;
 				background-color: rgba({{.AlbumArtColorRGB}}, 0.6);
+				background-image: linear-gradient(
+					30deg,
+					rgba(255, 255, 255, 0.05) 0%,
+					rgba(255, 255, 255, 0.20) 60%,
+					rgba(255, 255, 255, 0.10) 100%
+				);
 				border-radius: 8px;
 				box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
 			}
